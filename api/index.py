@@ -7,7 +7,7 @@ import base64
 
 # --- Importações de dependências ---
 try:
-    from firebase_admin import credentials, firestore, initialize_app
+    from firebase_admin import credentials, firestore, initialize_app, auth
     import firebase_admin
 except ImportError:
     firebase_admin = None
@@ -23,18 +23,13 @@ try:
     from sqlalchemy.exc import SQLAlchemyError
     from geoalchemy2 import Geography
     from geoalchemy2.shape import to_shape
+    from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 except ImportError:
     SQLAlchemyError = None
     declarative_base = None
     create_engine = None
-    Column = None
-    String = None
-    MetaData = None
-    sessionmaker = None
-    Geography = None
-    to_shape = None
-    text = None
-
+    Column = String = MetaData = sessionmaker = Geography = to_shape = text = None
+    urlparse = urlunparse = parse_qs = urlencode = None
 
 from flask_cors import CORS
 
@@ -47,7 +42,6 @@ db_init_error = None
 # --- Configuração do Flask ---
 app = Flask(__name__)
 CORS(app)
-
 
 # --- Configuração do Firebase ---
 db = None
@@ -71,8 +65,6 @@ if firebase_admin:
 else:
     firebase_init_error = "Biblioteca firebase_admin não encontrada."
 
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
-
 # --- Configuração do PostgreSQL (PostGIS) ---
 db_session = None
 engine = None
@@ -80,19 +72,19 @@ if create_engine:
     try:
         db_url = os.environ.get('POSTGRES_POSTGRES_URL')
         if db_url:
-            # Força o dialeto 'postgresql' que é mais explícito que o alias 'postgres'
             if db_url.startswith("postgres://"):
                 db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-            # Remove o parâmetro 'supa' da URL, que não é reconhecido pelo psycopg2
-            try:
-                parsed_url = urlparse(db_url)
-                query_params = parse_qs(parsed_url.query)
-                query_params.pop('supa', None)  # Remove a chave 'supa'
-                new_query = urlencode(query_params, doseq=True)
-                cleaned_url = urlunparse(parsed_url._replace(query=new_query))
-            except Exception:
-                cleaned_url = db_url # Falla-safe, usa a URL original se o parse falhar
+            cleaned_url = db_url
+            if urlparse:
+                try:
+                    parsed_url = urlparse(db_url)
+                    query_params = parse_qs(parsed_url.query)
+                    query_params.pop('supa', None)
+                    new_query = urlencode(query_params, doseq=True)
+                    cleaned_url = urlunparse(parsed_url._replace(query=new_query))
+                except Exception:
+                    pass
 
             engine = create_engine(cleaned_url)
             Session = sessionmaker(bind=engine)
@@ -107,7 +99,6 @@ if create_engine:
 else:
     postgres_init_error = "SQLAlchemy não encontrado."
 
-
 # --- Definição do Modelo de Dados Geoespacial ---
 Base = declarative_base() if declarative_base else object
 
@@ -117,7 +108,6 @@ if Base != object and Geography:
         user_id = Column(String, primary_key=True)
         location = Column(Geography(geometry_type='POINT', srid=4326), nullable=False)
 
-# --- Função para criar a tabela no banco ---
 def init_db():
     global db_init_error
     if not engine:
@@ -134,7 +124,6 @@ def init_db():
     except Exception as e:
         db_init_error = str(e)
         print(f"Erro ao criar tabela 'user_locations': {e}")
-
 
 # --- Configuração do Kafka Producer ---
 producer = None
@@ -158,7 +147,6 @@ if Producer:
         print(f"Erro ao inicializar Produtor Kafka: {e}")
 else:
     kafka_init_error = "Biblioteca confluent_kafka não encontrada."
-
 
 def delivery_report(err, msg):
     if err is not None:
@@ -214,7 +202,6 @@ def create_user():
             db_session.add(new_location)
 
         db.collection('users').document(user_id).set(firestore_data)
-        
         db_session.commit()
 
         publish_event('eventos_usuarios', 'UserCreated', user_id, user_data)
@@ -226,6 +213,102 @@ def create_user():
     except Exception as e:
         db_session.rollback()
         return jsonify({"error": f"Erro ao criar usuário: {e}"}), 500
+
+@app.route('/users/<user_id>', methods=['GET'])
+def get_user(user_id):
+    if not db or not db_session:
+        return jsonify({"error": "Dependências de banco de dados não inicializadas."}), 503
+
+    try:
+        user_doc = db.collection('users').document(user_id).get()
+        if not user_doc.exists:
+            return jsonify({"error": "Usuário não encontrado."}), 404
+        
+        user_data = user_doc.to_dict()
+        user_data['id'] = user_doc.id
+
+        location_record = db_session.query(UserLocation).filter_by(user_id=user_id).first()
+        if location_record and to_shape:
+            point = to_shape(location_record.location)
+            user_data['location'] = {'latitude': point.y, 'longitude': point.x}
+
+        return jsonify(user_data), 200
+    except Exception as e:
+        return jsonify({"error": f"Erro ao buscar usuário: {e}"}), 500
+
+@app.route('/users/<user_id>', methods=['PUT'])
+def update_user(user_id):
+    if not db or not db_session:
+        return jsonify({"error": "Dependências de banco de dados não inicializadas."}), 503
+
+    update_data = request.json
+    if not update_data:
+        return jsonify({"error": "Dados para atualização são obrigatórios."}), 400
+
+    user_ref = db.collection('users').document(user_id)
+
+    try:
+        if not user_ref.get().exists:
+            return jsonify({"error": "Usuário não encontrado."}), 404
+
+        firestore_data = update_data.copy()
+        location_data = firestore_data.pop('location', None)
+        firestore_data['updated_at'] = firestore.SERVER_TIMESTAMP
+
+        if location_data and 'latitude' in location_data and 'longitude' in location_data:
+            lat = location_data['latitude']
+            lon = location_data['longitude']
+            wkt_point = f'POINT({lon} {lat})'
+            
+            location_record = db_session.query(UserLocation).filter_by(user_id=user_id).first()
+            if location_record:
+                location_record.location = wkt_point
+            else:
+                new_location = UserLocation(user_id=user_id, location=wkt_point)
+                db_session.add(new_location)
+
+        if firestore_data:
+            user_ref.update(firestore_data)
+
+        db_session.commit()
+
+        publish_event('eventos_usuarios', 'UserUpdated', user_id, update_data)
+        return jsonify({"message": "Usuário atualizado com sucesso.", "id": user_id}), 200
+
+    except SQLAlchemyError as e:
+        db_session.rollback()
+        return jsonify({"error": f"Erro no banco de dados geoespacial: {e}"}), 500
+    except Exception as e:
+        db_session.rollback()
+        return jsonify({"error": f"Erro ao atualizar usuário: {e}"}), 500
+
+@app.route('/users/<user_id>', methods=['DELETE'])
+def delete_user(user_id):
+    if not db or not db_session:
+        return jsonify({"error": "Dependências de banco de dados não inicializadas."}), 503
+
+    user_ref = db.collection('users').document(user_id)
+
+    try:
+        if not user_ref.get().exists:
+            return jsonify({"error": "Usuário não encontrado."}), 404
+
+        location_record = db_session.query(UserLocation).filter_by(user_id=user_id).first()
+        if location_record:
+            db_session.delete(location_record)
+
+        user_ref.delete()
+        db_session.commit()
+
+        publish_event('eventos_usuarios', 'UserDeleted', user_id, {"user_id": user_id})
+        return '', 204
+
+    except SQLAlchemyError as e:
+        db_session.rollback()
+        return jsonify({"error": f"Erro no banco de dados geoespacial: {e}"}), 500
+    except Exception as e:
+        db_session.rollback()
+        return jsonify({"error": f"Erro ao deletar usuário: {e}"}), 500
 
 # --- Health Check (para Vercel) ---
 def get_health_status():
@@ -239,13 +322,10 @@ def get_health_status():
 
     pg_status = "error"
     pg_query_error = None
-    if db_session:
+    if db_session and text:
         try:
-            if text:
-                db_session.execute(text('SELECT 1'))
-                pg_status = "ok"
-            else:
-                pg_status = "error: sqlalchemy.text not imported"
+            db_session.execute(text('SELECT 1'))
+            pg_status = "ok"
         except Exception as e:
             pg_query_error = str(e)
             pg_status = f"error during query: {pg_query_error}"
