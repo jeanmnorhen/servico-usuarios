@@ -1,0 +1,7 @@
+Flask
+firebase-admin
+confluent-kafka
+psycopg2-binary
+SQLAlchemy
+GeoAlchemy2
+Flask-Cors
