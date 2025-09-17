@@ -36,7 +36,7 @@ from flask_cors import CORS
 # --- Variáveis globais para erros de inicialização ---
 firebase_init_error = None
 postgres_init_error = None
-kafka_init_error = None
+kafka_producer_init_error = None # Renamed for clarity
 db_init_error = None
 
 # --- Configuração do Flask ---
@@ -140,13 +140,13 @@ if Producer:
             producer = Producer(kafka_conf)
             print("Produtor Kafka inicializado com sucesso.")
         else:
-            kafka_init_error = "Variáveis de ambiente do Kafka não encontradas."
-            print(kafka_init_error)
+            kafka_producer_init_error = "Variáveis de ambiente do Kafka não encontradas."
+            print(kafka_producer_init_error)
     except Exception as e:
-        kafka_init_error = str(e)
+        kafka_producer_init_error = str(e)
         print(f"Erro ao inicializar Produtor Kafka: {e}")
 else:
-    kafka_init_error = "Biblioteca confluent_kafka não encontrada."
+    kafka_producer_init_error = "Biblioteca confluent_kafka não encontrada."
 
 def delivery_report(err, msg):
     if err is not None:
@@ -343,7 +343,7 @@ def get_health_status():
             "postgresql_engine": postgres_init_error,
             "postgresql_table": db_init_error,
             "postgresql_query": pg_query_error,
-            "kafka": kafka_init_error
+            "kafka_producer": kafka_producer_init_error # Renamed
         }
     }
     return status
